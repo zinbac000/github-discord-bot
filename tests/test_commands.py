@@ -1,0 +1,120 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from github_discord_bot.bot import NotAllowed, make_issue_group, on_command_error
+from github_discord_bot.github import GitHubError, Issue
+
+ROLE = 111
+
+
+def issue(number=1, title="Bug", state="open"):
+    return Issue(number, title, state, f"https://github.com/o/r/issues/{number}", ["bug"], "alice", "body")
+
+
+def interaction(role_ids=(ROLE,), done=False):
+    return SimpleNamespace(
+        user=SimpleNamespace(roles=[SimpleNamespace(id=i) for i in role_ids]),
+        response=SimpleNamespace(
+            defer=AsyncMock(), send_message=AsyncMock(), is_done=MagicMock(return_value=done)
+        ),
+        followup=SimpleNamespace(send=AsyncMock()),
+    )
+
+
+@pytest.fixture
+def gh():
+    return MagicMock(
+        create_issue=AsyncMock(return_value=issue(5, "New")),
+        list_issues=AsyncMock(return_value=[issue(1), issue(2, "Other")]),
+        get_issue=AsyncMock(return_value=issue(3)),
+        close_issue=AsyncMock(return_value=issue(3, state="closed")),
+        comment=AsyncMock(return_value="https://github.com/o/r/issues/3#c"),
+    )
+
+
+@pytest.fixture
+def group(gh):
+    return make_issue_group(gh, ROLE)
+
+
+def cmd(group, name):
+    return group.get_command(name)
+
+
+async def passes_checks(command, i):
+    return [await check(i) for check in command.checks]
+
+
+async def test_create_replies_with_link(group, gh):
+    i = interaction()
+    await cmd(group, "create").callback(i, "New", "details")
+    gh.create_issue.assert_awaited_once_with("New", "details")
+    i.response.defer.assert_awaited_once()
+    assert "issues/5" in i.followup.send.await_args.args[0]
+
+
+async def test_list_defaults_and_filters(group, gh):
+    i = interaction()
+    await cmd(group, "list").callback(i, "closed", "bug")
+    gh.list_issues.assert_awaited_once_with(state="closed", label="bug", limit=10)
+    embed = i.followup.send.await_args.kwargs["embed"]
+    assert "#1" in embed.description and "#2" in embed.description
+
+
+async def test_list_empty(group, gh):
+    gh.list_issues.return_value = []
+    i = interaction()
+    await cmd(group, "list").callback(i, "open", None)
+    assert "No open issues" in i.followup.send.await_args.args[0]
+
+
+async def test_view(group, gh):
+    i = interaction()
+    await cmd(group, "view").callback(i, 3)
+    embed = i.followup.send.await_args.kwargs["embed"]
+    assert embed.title == "#3 Bug"
+
+
+@pytest.mark.parametrize("name", ["create", "close", "comment"])
+async def test_write_commands_deny_without_role(group, name):
+    with pytest.raises(NotAllowed):
+        await passes_checks(cmd(group, name), interaction(role_ids=(999,)))
+
+
+@pytest.mark.parametrize("name", ["create", "close", "comment"])
+async def test_write_commands_allow_with_role(group, name):
+    assert await passes_checks(cmd(group, name), interaction()) == [True]
+
+
+@pytest.mark.parametrize("name", ["list", "view"])
+def test_read_commands_have_no_role_gate(group, name):
+    assert cmd(group, name).checks == []
+
+
+async def test_close_and_comment(group, gh):
+    i = interaction()
+    await cmd(group, "close").callback(i, 3)
+    assert "Closed" in i.followup.send.await_args.args[0]
+    await cmd(group, "comment").callback(i, 3, "thanks")
+    gh.comment.assert_awaited_once_with(3, "thanks")
+
+
+async def test_error_handler_not_allowed_is_ephemeral():
+    i = interaction()
+    await on_command_error(i, NotAllowed())
+    assert i.response.send_message.await_args.kwargs["ephemeral"] is True
+
+
+async def test_error_handler_shows_github_message_after_defer():
+    i = interaction(done=True)
+    wrapped = SimpleNamespace(original=GitHubError("token expired"))
+    await on_command_error(i, wrapped)
+    assert i.followup.send.await_args.args[0] == "token expired"
+
+
+async def test_error_handler_swallows_unexpected_errors():
+    i = interaction()
+    await on_command_error(i, RuntimeError("boom"))
+    assert "went wrong" in i.response.send_message.await_args.args[0]
