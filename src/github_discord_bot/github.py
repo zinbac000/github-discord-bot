@@ -1,8 +1,13 @@
+import re
 from dataclasses import dataclass, field
 
 import httpx
 
 API = "https://api.github.com"
+LOGIN_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+PAGE_SIZE = 20
+FETCH_SIZE = 100  # GitHub items per request while filling a page
+MAX_FETCHES = 10  # most GitHub requests spent on one page of results
 
 
 class GitHubError(Exception):
@@ -23,6 +28,7 @@ class Issue:
     labels: list[str] = field(default_factory=list)
     author: str = ""
     body: str = ""
+    assignees: list[str] = field(default_factory=list)
 
 
 def _issue(data: dict) -> Issue:
@@ -34,7 +40,19 @@ def _issue(data: dict) -> Issue:
         labels=[label["name"] for label in data.get("labels", [])],
         author=(data.get("user") or {}).get("login", ""),
         body=data.get("body") or "",
+        assignees=[a["login"] for a in data.get("assignees") or []],
     )
+
+
+def _check_login(login: str) -> str:
+    login = login.strip().lstrip("@")
+    if not LOGIN_RE.match(login):
+        raise GitHubError("That is not a valid GitHub username.")
+    return login
+
+
+def _has(logins: list[str], login: str) -> bool:
+    return login.lower() in (name.lower() for name in logins)
 
 
 def _error_for(status: int) -> GitHubError:
@@ -69,14 +87,17 @@ class GitHubClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs):
+    async def _send(self, method: str, path: str, **kwargs) -> httpx.Response:
         try:
             response = await self._http.request(method, f"/repos/{self._repo}{path}", **kwargs)
         except httpx.HTTPError:
             raise GitHubError("Could not reach GitHub. Try again in a moment.") from None
         if response.is_error:
             raise _error_for(response.status_code)
-        return response.json()
+        return response
+
+    async def _request(self, method: str, path: str, **kwargs):
+        return (await self._send(method, path, **kwargs)).json()
 
     async def create_issue(
         self, title: str, body: str = "", labels: list[str] | None = None
@@ -87,15 +108,31 @@ class GitHubClient:
         return _issue(await self._request("POST", "/issues", json=payload))
 
     async def list_issues(
-        self, state: str = "open", label: str | None = None, limit: int = 10
-    ) -> list[Issue]:
-        params: dict = {"state": state, "per_page": 100}
+        self,
+        state: str = "open",
+        label: str | None = None,
+        page: int = 1,
+        per_page: int = PAGE_SIZE,
+    ) -> tuple[list[Issue], bool]:
+        """Page `page` of issues (`per_page` each), and whether there are more after it.
+
+        GitHub mixes pull requests into this endpoint (they carry a "pull_request" key), so a
+        GitHub page can hold few or no issues. We therefore read GitHub pages until we have
+        enough issues to fill ours, instead of paging GitHub directly.
+        """
+        params: dict = {"state": state, "per_page": FETCH_SIZE}
         if label:
             params["labels"] = label
-        data = await self._request("GET", "/issues", params=params)
-        # The issues endpoint also returns pull requests; they carry a "pull_request" key.
-        issues = [_issue(item) for item in data if "pull_request" not in item]
-        return issues[:limit]
+        start = (page - 1) * per_page
+        collected: list[Issue] = []
+        more, fetched = True, 0
+        while more and fetched < MAX_FETCHES and len(collected) <= start + per_page:
+            fetched += 1
+            response = await self._send("GET", "/issues", params={**params, "page": fetched})
+            collected += [_issue(i) for i in response.json() if "pull_request" not in i]
+            more = "next" in response.links
+        has_next = len(collected) > start + per_page or more
+        return collected[start : start + per_page], has_next
 
     async def get_issue(self, number: int) -> Issue:
         data = await self._request("GET", f"/issues/{number}")
@@ -106,6 +143,40 @@ class GitHubClient:
     async def close_issue(self, number: int) -> Issue:
         await self.get_issue(number)  # refuses pull requests before anything is closed
         return _issue(await self._request("PATCH", f"/issues/{number}", json={"state": "closed"}))
+
+    async def assignable_login(self, login: str) -> str | None:
+        """GitHub's canonical casing of `login` if the repo can assign it, else None."""
+        login = _check_login(login)
+        users = await self._request("GET", "/assignees", params={"per_page": 100})
+        return next((u["login"] for u in users if u["login"].lower() == login.lower()), None)
+
+    async def assign(self, number: int, login: str) -> Issue:
+        await self.get_issue(number)  # refuses pull requests
+        canonical = await self.assignable_login(login)
+        if canonical is None:
+            raise GitHubError(f"{login.strip().lstrip('@')} cannot be assigned in this repo.")
+        data = await self._request(
+            "POST", f"/issues/{number}/assignees", json={"assignees": [canonical]}
+        )
+        issue = _issue(data)
+        # GitHub silently ignores users it cannot assign, so trust the response, not the status.
+        if not _has(issue.assignees, canonical):
+            raise GitHubError(f"GitHub did not assign {canonical} to #{number}.")
+        return issue
+
+    async def unassign(self, number: int, login: str) -> Issue:
+        login = _check_login(login)
+        issue = await self.get_issue(number)  # refuses pull requests
+        current = next((a for a in issue.assignees if a.lower() == login.lower()), None)
+        if current is None:
+            raise GitHubError(f"{login} is not assigned to #{number}.")
+        data = await self._request(
+            "DELETE", f"/issues/{number}/assignees", json={"assignees": [current]}
+        )
+        issue = _issue(data)
+        if _has(issue.assignees, current):
+            raise GitHubError(f"GitHub did not unassign {current} from #{number}.")
+        return issue
 
     async def comment(self, number: int, body: str) -> str:
         data = await self._request("POST", f"/issues/{number}/comments", json={"body": body})

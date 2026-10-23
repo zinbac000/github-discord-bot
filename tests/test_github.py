@@ -1,3 +1,5 @@
+import json
+
 import httpx
 import pytest
 import respx
@@ -42,16 +44,50 @@ async def test_list_issues_filters_pull_requests_and_applies_params(client):
     route = respx.get(f"{BASE}/issues").respond(
         200, json=[raw_issue(1), raw_issue(2, pull_request={"url": "x"}), raw_issue(3)]
     )
-    issues = await client.list_issues(state="closed", label="bug")
-    assert [i.number for i in issues] == [1, 3]
+    issues, has_next = await client.list_issues(state="closed", label="bug")
+    assert [i.number for i in issues] == [1, 3] and has_next is False
     params = route.calls[0].request.url.params
     assert params["state"] == "closed" and params["labels"] == "bug"
+    assert params["per_page"] == "100" and params["page"] == "1"
 
 
 @respx.mock
-async def test_list_issues_respects_limit(client):
+async def test_a_page_is_filled_across_github_pages_that_are_mostly_pull_requests(client):
+    nxt = {"Link": f'<{BASE}/issues?page=2>; rel="next"'}
+
+    def serve(request):
+        if request.url.params["page"] == "1":  # 90 PRs and only 10 issues
+            body = [raw_issue(n, pull_request={"url": "x"}) for n in range(1, 91)]
+            body += [raw_issue(n) for n in range(1000, 1010)]
+            return httpx.Response(200, json=body, headers=nxt)
+        return httpx.Response(200, json=[raw_issue(n) for n in range(2000, 2015)])
+
+    respx.get(f"{BASE}/issues").mock(side_effect=serve)
+    first, has_next = await client.list_issues(page=1)
+    assert len(first) == 20 and has_next is True  # 25 issues exist, 5 are left over
+    second, has_next = await client.list_issues(page=2)
+    assert [i.number for i in second] == [2010, 2011, 2012, 2013, 2014] and has_next is False
+    assert not {i.number for i in first} & {i.number for i in second}
+
+
+@respx.mock
+async def test_a_short_last_page_has_no_next(client):
     respx.get(f"{BASE}/issues").respond(200, json=[raw_issue(n) for n in range(1, 6)])
-    assert len(await client.list_issues(limit=2)) == 2
+    issues, has_next = await client.list_issues()
+    assert len(issues) == 5 and has_next is False
+    assert await client.list_issues(page=2) == ([], False)
+
+
+@respx.mock
+async def test_filling_a_page_stops_after_a_bounded_number_of_requests(client):
+    route = respx.get(f"{BASE}/issues").respond(
+        200,
+        json=[raw_issue(n, pull_request={"url": "x"}) for n in range(1, 101)],
+        headers={"Link": f'<{BASE}/issues?page=2>; rel="next"'},
+    )
+    issues, has_next = await client.list_issues()
+    assert issues == [] and has_next is True  # unknown, so the caller is told there may be more
+    assert route.call_count == 10
 
 
 @respx.mock
@@ -104,3 +140,81 @@ async def test_pull_requests_are_refused_and_never_closed(client):
     with pytest.raises(GitHubError, match="pull request"):
         await client.close_issue(9)
     assert not patch.called
+
+
+def assignee(login):
+    return {"login": login}
+
+
+@respx.mock
+async def test_assign_sends_canonical_casing_and_checks_the_response(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5))
+    respx.get(f"{BASE}/assignees").respond(200, json=[assignee("Zinbac000"), assignee("octocat")])
+    post = respx.post(f"{BASE}/issues/5/assignees").respond(
+        201, json=raw_issue(5, assignees=[assignee("Zinbac000")])
+    )
+    issue = await client.assign(5, "@zinbac000")
+    assert issue.assignees == ["Zinbac000"]
+    assert json.loads(post.calls[0].request.content) == {"assignees": ["Zinbac000"]}
+
+
+@respx.mock
+async def test_assign_reports_failure_when_github_silently_ignores_the_user(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5))
+    respx.get(f"{BASE}/assignees").respond(200, json=[assignee("zinbac000")])
+    respx.post(f"{BASE}/issues/5/assignees").respond(201, json=raw_issue(5, assignees=[]))
+    with pytest.raises(GitHubError, match="did not assign"):
+        await client.assign(5, "zinbac000")
+
+
+@respx.mock
+async def test_assign_refuses_users_the_repo_cannot_assign_without_writing(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5))
+    respx.get(f"{BASE}/assignees").respond(200, json=[assignee("octocat")])
+    post = respx.post(f"{BASE}/issues/5/assignees").respond(201, json=raw_issue(5))
+    with pytest.raises(GitHubError, match="cannot be assigned"):
+        await client.assign(5, "stranger")
+    assert not post.called
+
+
+@pytest.mark.parametrize("bad", ["../x", "a b", "x" * 40, "", "a/b"])
+async def test_logins_are_validated_before_any_request(client, bad):
+    with pytest.raises(GitHubError, match="valid GitHub username"):
+        await client.assignable_login(bad)
+    with pytest.raises(GitHubError, match="valid GitHub username"):
+        await client.unassign(1, bad)
+
+
+@respx.mock
+async def test_assign_and_unassign_refuse_pull_requests(client):
+    respx.get(f"{BASE}/issues/9").respond(200, json=raw_issue(9, pull_request={"url": "x"}))
+    with pytest.raises(GitHubError, match="pull request"):
+        await client.assign(9, "zinbac000")
+    with pytest.raises(GitHubError, match="pull request"):
+        await client.unassign(9, "zinbac000")
+
+
+@respx.mock
+async def test_unassign_removes_the_person(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5, assignees=[assignee("Zinbac000")]))
+    delete = respx.delete(f"{BASE}/issues/5/assignees").respond(200, json=raw_issue(5, assignees=[]))
+    issue = await client.unassign(5, "zinbac000")
+    assert issue.assignees == []
+    assert json.loads(delete.calls[0].request.content) == {"assignees": ["Zinbac000"]}
+
+
+@respx.mock
+async def test_unassign_of_someone_not_assigned_makes_no_write_call(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5, assignees=[assignee("octocat")]))
+    delete = respx.delete(f"{BASE}/issues/5/assignees").respond(200, json=raw_issue(5))
+    with pytest.raises(GitHubError, match="is not assigned"):
+        await client.unassign(5, "zinbac000")
+    assert not delete.called
+
+
+@respx.mock
+async def test_unassign_reports_failure_when_the_person_is_still_assigned(client):
+    respx.get(f"{BASE}/issues/5").respond(200, json=raw_issue(5, assignees=[assignee("zinbac000")]))
+    respx.delete(f"{BASE}/issues/5/assignees").respond(200, json=raw_issue(5, assignees=[assignee("zinbac000")]))
+    with pytest.raises(GitHubError, match="did not unassign"):
+        await client.unassign(5, "zinbac000")

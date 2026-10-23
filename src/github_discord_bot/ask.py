@@ -1,18 +1,24 @@
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import replace
 
 import discord
 
+from . import bulk
 from .github import GitHubClient, GitHubError
 from .intent import WRITE_ACTIONS, AIError, GroqClient, Intent
-from .render import clip, issue_line, list_embed, view_embed
+from .listing import first_page
+from .render import clip, issue_line, view_embed
 
 log = logging.getLogger(__name__)
 
 CONFIRM_TIMEOUT = 120
+BULK_CONFIRM_TIMEOUT = 300
 PREVIEW_BODY_LIMIT = 3000
+_MENTION = re.compile(r"<@!?(\d+)>")
 
 MESSAGES = {
     "en": {
@@ -33,6 +39,24 @@ MESSAGES = {
         "created": "Created {line}",
         "closed": "Closed {line}",
         "commented": "Commented on #{number}: {url}",
+        "assign": "**Assign this issue?**\n#{number}: {title}\n**Assign to:** {login}\n**Already assigned:** {current}",
+        "unassign": "**Unassign this issue?**\n#{number}: {title}\n**Remove:** {login}\n**Currently assigned:** {current}",
+        "assigned": "Assigned {login} to {line}",
+        "unassigned": "Unassigned {login} from {line}",
+        "unmapped": "I don't know which GitHub account that is. Please give a GitHub username.",
+        "nobody": "nobody",
+        "bulk_create": "**Create {n} issues?**",
+        "bulk_close": "**Close {n} issues?**",
+        "bulk_comment": "**Comment on {n} issues?**\n**Comment:** {body}",
+        "bulk_assign": "**Assign {login} to {n} issues?**",
+        "bulk_unassign": "**Unassign {login} from {n} issues?**",
+        "bulk_view": "**{n} issues**",
+        "bulk_not_run": "({n} will not run)",
+        "bulk_shortened": "_(list shortened, the full list is attached)_",
+        "bulk_nothing": "Nothing to do: every listed issue is skipped or cannot run.",
+        "report": "**Done:** {ok} ok, {skipped} skipped, {failed} failed, {unknown} unknown, {not_attempted} not attempted.",
+        "report_more": "...and {n} more problems (see the attached report)",
+        "report_retry": "Retry: {items}",
     },
     "vi": {
         "create": "**Tạo issue này?**\n**Tiêu đề:** {title}\n**Nội dung:**\n{body}",
@@ -52,6 +76,24 @@ MESSAGES = {
         "created": "Đã tạo {line}",
         "closed": "Đã đóng {line}",
         "commented": "Đã bình luận vào #{number}: {url}",
+        "assign": "**Gán issue này?**\n#{number}: {title}\n**Gán cho:** {login}\n**Đang được gán:** {current}",
+        "unassign": "**Bỏ gán issue này?**\n#{number}: {title}\n**Bỏ:** {login}\n**Đang được gán:** {current}",
+        "assigned": "Đã gán {login} cho {line}",
+        "unassigned": "Đã bỏ gán {login} khỏi {line}",
+        "unmapped": "Mình chưa biết đó là tài khoản GitHub nào. Hãy nêu tên tài khoản GitHub.",
+        "nobody": "chưa có ai",
+        "bulk_create": "**Tạo {n} issue?**",
+        "bulk_close": "**Đóng {n} issue?**",
+        "bulk_comment": "**Bình luận vào {n} issue?**\n**Bình luận:** {body}",
+        "bulk_assign": "**Gán {login} cho {n} issue?**",
+        "bulk_unassign": "**Bỏ gán {login} khỏi {n} issue?**",
+        "bulk_view": "**{n} issue**",
+        "bulk_not_run": "({n} issue sẽ không chạy)",
+        "bulk_shortened": "_(danh sách đã rút gọn, danh sách đầy đủ nằm trong file đính kèm)_",
+        "bulk_nothing": "Không có gì để làm: mọi issue đã nêu đều bị bỏ qua hoặc không chạy được.",
+        "report": "**Xong:** {ok} thành công, {skipped} bỏ qua, {failed} lỗi, {unknown} không rõ, {not_attempted} chưa thực hiện.",
+        "report_more": "...và {n} vấn đề nữa (xem báo cáo đính kèm)",
+        "report_retry": "Thử lại: {items}",
     },
 }
 
@@ -73,7 +115,20 @@ async def describe(gh: GitHubClient, intent: Intent) -> str:
         text = m["create"].format(title=intent.title, body=clip(body, PREVIEW_BODY_LIMIT) or "-")
     else:
         issue = await gh.get_issue(intent.number)
-        if intent.action == "close":
+        if intent.action in ("assign", "unassign"):
+            current = ", ".join(issue.assignees) or m["nobody"]
+            if intent.action == "assign":
+                login = await gh.assignable_login(intent.assignee)
+                if login is None:
+                    raise GitHubError(f"{intent.assignee} cannot be assigned in this repo.")
+            else:
+                login = next((a for a in issue.assignees if a.lower() == intent.assignee.lower()), None)
+                if login is None:
+                    raise GitHubError(f"{intent.assignee} is not assigned to #{issue.number}.")
+            text = m[intent.action].format(
+                number=issue.number, title=clip(issue.title, 200), login=login, current=current
+            )
+        elif intent.action == "close":
             text = m["close"].format(number=issue.number, title=clip(issue.title, 200))
         else:
             text = m["comment"].format(
@@ -84,14 +139,20 @@ async def describe(gh: GitHubClient, intent: Intent) -> str:
     return text + (m["shortened"] if shortened else "")
 
 
-async def run_read(gh: GitHubClient, intent: Intent) -> tuple[str | None, discord.Embed | None]:
+async def run_read(
+    gh: GitHubClient, intent: Intent, owner_id: int = 0
+) -> tuple[str | None, discord.Embed | None, discord.ui.View | None]:
     m = MESSAGES[intent.lang]
     if intent.action == "list":
-        issues = await gh.list_issues(state=intent.state, label=intent.label, limit=10)
-        if not issues:
-            return m["no_issues"].format(state=intent.state), None
-        return None, list_embed(issues, intent.state)
-    return None, view_embed(await gh.get_issue(intent.number))
+        return await first_page(
+            gh,
+            intent.state,
+            intent.label,
+            owner_id,
+            m["no_issues"].format(state=intent.state),
+            lang=intent.lang,
+        )
+    return None, view_embed(await gh.get_issue(intent.number)), None
 
 
 async def run_write(gh: GitHubClient, intent: Intent) -> str:
@@ -102,15 +163,45 @@ async def run_write(gh: GitHubClient, intent: Intent) -> str:
     if intent.action == "close":
         issue = await gh.close_issue(intent.number)
         return m["closed"].format(line=issue_line(issue))
+    if intent.action == "assign":
+        issue = await gh.assign(intent.number, intent.assignee)
+        return m["assigned"].format(login=intent.assignee, line=issue_line(issue))
+    if intent.action == "unassign":
+        issue = await gh.unassign(intent.number, intent.assignee)
+        return m["unassigned"].format(login=intent.assignee, line=issue_line(issue))
     url = await gh.comment(intent.number, intent.body)
     return m["commented"].format(number=intent.number, url=url)
+
+
+def resolve_assignee(
+    intent: Intent, text: str, user_id: int, user_map: dict[int, str]
+) -> str | None:
+    """The GitHub login the user means, or None. The model never decides who this is."""
+    if intent.assignee_kind == "login":
+        return intent.assignee or None
+    if intent.assignee_kind == "self":
+        return user_map.get(user_id)
+    mentioned = set(_MENTION.findall(text))
+    if len(mentioned) != 1:
+        return None
+    return user_map.get(int(next(iter(mentioned))))
 
 
 class ConfirmView(discord.ui.View):
     """Single-use Confirm and Cancel for a write intent. Only the asker may press."""
 
-    def __init__(self, *, gh: GitHubClient, intent: Intent, owner_id: int, role_id: int):
-        super().__init__(timeout=CONFIRM_TIMEOUT)
+    def __init__(
+        self,
+        *,
+        gh: GitHubClient,
+        intent: Intent,
+        owner_id: int,
+        role_id: int,
+        items: list[bulk.Item] | None = None,
+        timeout: float = CONFIRM_TIMEOUT,
+    ):
+        super().__init__(timeout=timeout)
+        self.items = items  # the frozen bulk list shown in the preview, never rebuilt
         self.gh = gh
         self.intent = intent
         self.owner_id = owner_id
@@ -146,15 +237,22 @@ class ConfirmView(discord.ui.View):
             return
 
         await interaction.response.edit_message(content=self._m["working"], embed=None, view=self)
+        file = None
         try:
-            result = await run_write(self.gh, self.intent)
+            if self.items is not None:
+                outcomes = await bulk.execute(self.gh, self.intent, self.items)
+                result, full = bulk.report(outcomes, self._m)
+                file = bulk.as_file(full, "bulk-report.txt") if full else None
+            else:
+                result = await run_write(self.gh, self.intent)
         except GitHubError as exc:
             result = exc.message
         except Exception:
             log.exception("Confirmed action failed")
             result = self._m["failed"]
         try:
-            await interaction.edit_original_response(content=result, view=None)
+            extra = {"attachments": [file]} if file else {}
+            await interaction.edit_original_response(content=result, view=None, **extra)
         except discord.HTTPException:
             log.exception("Could not show the result of a confirmed action: %s", result)
 
@@ -213,7 +311,8 @@ def _audit(user_id: int, text: str, intent: Intent | None, outcome: str) -> None
         what = "-"
     else:
         what = (
-            f"{intent.action} number={intent.number} title={clip(intent.title, 60)!r} "
+            f"{intent.action} number={intent.number} numbers={clip(','.join(map(str, intent.numbers)), 80)} "
+            f"titles={len(intent.titles)} title={clip(intent.title, 60)!r} "
             f"state={intent.state} label={intent.label}"
         )
     log.info("ask user=%s text=%r intent=[%s] outcome=%s", user_id, clip(text, 200), what, outcome)
@@ -229,6 +328,7 @@ async def handle_text(
     groq: GroqClient,
     limiter: Limiter,
     reply: Reply,
+    user_map: dict[int, str] | None = None,
 ) -> None:
     """Shared flow for `/ask` and mentions. `reply(content=, embed=, view=, ephemeral=)`."""
     if not limiter.check(user_id):
@@ -248,6 +348,34 @@ async def handle_text(
         await reply(content=intent.question, ephemeral=True)
         return
 
+    await submit(
+        intent=intent,
+        text=text,
+        user_id=user_id,
+        role_ids=role_ids,
+        role_id=role_id,
+        gh=gh,
+        reply=reply,
+        user_map=user_map,
+    )
+
+
+def _file_kwargs(full: str | None, name: str) -> dict:
+    return {"file": bulk.as_file(full, name)} if full else {}
+
+
+async def submit(
+    *,
+    intent: Intent,
+    text: str,
+    user_id: int,
+    role_ids: Iterable[int],
+    role_id: int,
+    gh: GitHubClient,
+    reply: Reply,
+    user_map: dict[int, str] | None = None,
+) -> None:
+    """Run a validated intent: gate, preview, confirm. Shared by AI input and /bulk."""
     m = MESSAGES[intent.lang]
     is_write = intent.action in WRITE_ACTIONS
     if is_write and role_id not in set(role_ids):
@@ -255,11 +383,26 @@ async def handle_text(
         await reply(content=m["denied"], ephemeral=True)
         return
 
+    if intent.action in ("assign", "unassign"):
+        login = resolve_assignee(intent, text, user_id, user_map or {})
+        if login is None:
+            _audit(user_id, text, intent, "unmapped")
+            await reply(content=m["unmapped"], ephemeral=True)
+            return
+        intent = replace(intent, assignee=login, assignee_kind="login")
+
+    if bulk.is_bulk(intent):
+        await _submit_bulk(intent, text, user_id, role_id, gh, reply)
+        return
+
     try:
         if not is_write:
-            content, embed = await run_read(gh, intent)
+            content, embed, page_view = await run_read(gh, intent, user_id)
             _audit(user_id, text, intent, "ok")
-            await reply(content=content, embed=embed)
+            if page_view is None:
+                await reply(content=content, embed=embed)
+            else:
+                page_view.message = await reply(content=content, embed=embed, view=page_view)
             return
         preview = await describe(gh, intent)
     except GitHubError as exc:
@@ -272,3 +415,36 @@ async def handle_text(
     view.message = await reply(
         embed=discord.Embed(description=clip(preview, 4000)), view=view, ephemeral=True
     )
+
+
+async def _submit_bulk(
+    intent: Intent, text: str, user_id: int, role_id: int, gh: GitHubClient, reply: Reply
+) -> None:
+    m = MESSAGES[intent.lang]
+    try:
+        items = await bulk.prepare(gh, intent)
+    except GitHubError as exc:
+        _audit(user_id, text, intent, "github_error")
+        await reply(content=exc.message, ephemeral=True)
+        return
+
+    if intent.action == "view":
+        shown, full = bulk.view_summary(items, m)
+        _audit(user_id, text, intent, "ok")
+        await reply(embed=discord.Embed(description=shown), **_file_kwargs(full, "bulk-view.txt"))
+        return
+
+    shown, full, todo = bulk.preview(intent, items, m)
+    files = _file_kwargs(full, "bulk-preview.txt")
+    embed = discord.Embed(description=clip(shown, 4000))
+    if todo == 0:
+        _audit(user_id, text, intent, "nothing_to_do")
+        await reply(content=m["bulk_nothing"], embed=embed, ephemeral=True, **files)
+        return
+
+    view = ConfirmView(
+        gh=gh, intent=intent, owner_id=user_id, role_id=role_id, items=items,
+        timeout=BULK_CONFIRM_TIMEOUT,
+    )
+    _audit(user_id, text, intent, "preview")
+    view.message = await reply(embed=embed, view=view, ephemeral=True, **files)

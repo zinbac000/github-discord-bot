@@ -15,7 +15,7 @@ def issue(number=1, title="Bug", state="open"):
 
 def interaction(role_ids=(ROLE,), done=False):
     return SimpleNamespace(
-        user=SimpleNamespace(roles=[SimpleNamespace(id=i) for i in role_ids]),
+        user=SimpleNamespace(id=7, roles=[SimpleNamespace(id=i) for i in role_ids]),
         response=SimpleNamespace(
             defer=AsyncMock(), send_message=AsyncMock(), is_done=MagicMock(return_value=done)
         ),
@@ -27,7 +27,7 @@ def interaction(role_ids=(ROLE,), done=False):
 def gh():
     return MagicMock(
         create_issue=AsyncMock(return_value=issue(5, "New")),
-        list_issues=AsyncMock(return_value=[issue(1), issue(2, "Other")]),
+        list_issues=AsyncMock(return_value=([issue(1), issue(2, "Other")], False)),
         get_issue=AsyncMock(return_value=issue(3)),
         close_issue=AsyncMock(return_value=issue(3, state="closed")),
         comment=AsyncMock(return_value="https://github.com/o/r/issues/3#c"),
@@ -58,16 +58,16 @@ async def test_create_replies_with_link(group, gh):
 async def test_list_defaults_and_filters(group, gh):
     i = interaction()
     await cmd(group, "list").callback(i, "closed", "bug")
-    gh.list_issues.assert_awaited_once_with(state="closed", label="bug", limit=10)
+    gh.list_issues.assert_awaited_once_with("closed", "bug", page=1)
     embed = i.followup.send.await_args.kwargs["embed"]
     assert "#1" in embed.description and "#2" in embed.description
 
 
 async def test_list_empty(group, gh):
-    gh.list_issues.return_value = []
+    gh.list_issues.return_value = ([], False)
     i = interaction()
     await cmd(group, "list").callback(i, "open", None)
-    assert "No open issues" in i.followup.send.await_args.args[0]
+    assert "No open issues" in i.followup.send.await_args.kwargs["content"]
 
 
 async def test_view(group, gh):
@@ -118,3 +118,21 @@ async def test_error_handler_swallows_unexpected_errors():
     i = interaction()
     await on_command_error(i, RuntimeError("boom"))
     assert "went wrong" in i.response.send_message.await_args.args[0]
+
+
+@pytest.mark.parametrize("name", ["assign", "unassign"])
+async def test_assign_commands_are_role_gated(group, name):
+    with pytest.raises(NotAllowed):
+        await passes_checks(cmd(group, name), interaction(role_ids=(999,)))
+    assert await passes_checks(cmd(group, name), interaction()) == [True]
+
+
+async def test_assign_and_unassign_reply_with_the_person(group, gh):
+    gh.assign = AsyncMock(return_value=issue(3))
+    gh.unassign = AsyncMock(return_value=issue(3))
+    i = interaction()
+    await cmd(group, "assign").callback(i, 3, "@zinbac000")
+    gh.assign.assert_awaited_once_with(3, "@zinbac000")
+    assert "Assigned zinbac000" in i.followup.send.await_args.args[0]
+    await cmd(group, "unassign").callback(i, 3, "zinbac000")
+    assert "Unassigned zinbac000" in i.followup.send.await_args.args[0]

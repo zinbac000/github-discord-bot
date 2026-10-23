@@ -176,3 +176,57 @@ def test_digits_inside_words_or_a_comment_body_are_not_extra_issue_numbers():
     assert ok.action == "comment"
     assert validate_intent(Intent("view", number=12), "view 12 (v2 build)").action == "view"
     assert validate_intent(Intent("close", number=15), "close 12 not 15").action == "clarify"
+
+
+@pytest.mark.parametrize("action", ["assign", "unassign"])
+def test_assign_with_a_typed_login_passes(action):
+    out = validate_intent(Intent(action, number=12, assignee_kind="login", assignee="Zinbac000"), "assign 12 to zinbac000")
+    assert out.action == action and out.assignee == "Zinbac000"
+
+
+def test_assign_login_the_user_never_wrote_becomes_clarify():
+    out = validate_intent(Intent("assign", number=12, assignee_kind="login", assignee="octocat"), "assign 12 to bob")
+    assert out.action == "clarify"
+
+
+@pytest.mark.parametrize("login", ["../x", "a b", "x" * 40])
+def test_assign_with_an_invalid_login_becomes_clarify(login):
+    out = validate_intent(Intent("assign", number=12, assignee_kind="login", assignee=login), f"assign 12 to {login}")
+    assert out.action == "clarify"
+
+
+def test_assign_self_and_mention_kinds():
+    assert validate_intent(Intent("assign", number=12, assignee_kind="self"), "assign 12 to me").action == "assign"
+    assert validate_intent(Intent("assign", number=12, assignee_kind="mention"), "assign 12 to <@42>").action == "assign"
+    assert validate_intent(Intent("assign", number=12, assignee_kind="mention"), "assign 12 to someone").action == "clarify"
+    assert validate_intent(Intent("assign", number=12, assignee_kind="whoever"), "assign 12").action == "clarify"
+
+
+def test_assign_needs_a_typed_issue_number():
+    out = validate_intent(Intent("assign", number=12, assignee_kind="self"), "assign the login bug to me")
+    assert out.action == "clarify"
+
+
+@respx.mock
+async def test_groq_assign_tool_call_is_parsed(groq):
+    respx.post(URL).respond(
+        200, json=tool_response("assign_issue", number=12, assignee_kind="login", assignee="zinbac000", lang="vi")
+    )
+    intent = await groq.parse("gán issue 12 cho zinbac000")
+    assert (intent.action, intent.number, intent.assignee, intent.lang) == ("assign", 12, "zinbac000", "vi")
+
+
+@respx.mock
+async def test_groq_bulk_numbers_and_titles_are_parsed(groq):
+    respx.post(URL).mock(
+        side_effect=[
+            httpx.Response(200, json=tool_response("close_issue", numbers=["12", "15-16"], lang="en")),
+            httpx.Response(200, json=tool_response("create_issue", titles=["fix login", "add dark mode"], lang="en")),
+            httpx.Response(200, json=tool_response("close_issue", numbers=["abc"], lang="en")),
+        ]
+    )
+    closed = await groq.parse("close 12 and 15-16")
+    assert closed.action == "close" and closed.numbers == (12, 15, 16)
+    created = await groq.parse("create issues: fix login; add dark mode")
+    assert created.titles == ("fix login", "add dark mode")
+    assert (await groq.parse("close abc")).action == "clarify"

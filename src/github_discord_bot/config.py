@@ -1,11 +1,12 @@
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import dotenv_values
 
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
@@ -23,6 +24,7 @@ class Settings:
     groq_api_key: str | None = None
     groq_model: str = DEFAULT_GROQ_MODEL
     groq_fallback_model: str | None = None
+    github_user_map: dict[int, str] = field(default_factory=dict)
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -57,6 +59,15 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     allowed_role_id = number("ALLOWED_ROLE_ID", required=True)
     discord_guild_id = number("DISCORD_GUILD_ID", required=False)
 
+    user_map: dict[int, str] = {}
+    for pair in filter(None, (p.strip() for p in (env.get("GITHUB_USER_MAP") or "").split(","))):
+        discord_id, _, login = pair.partition("=")
+        discord_id, login = discord_id.strip(), login.strip().lstrip("@")
+        if discord_id.isdigit() and _LOGIN_RE.match(login):
+            user_map[int(discord_id)] = login
+        else:
+            problems.append(f"GITHUB_USER_MAP entry {pair!r} must look like <discord id>=<github login>")
+
     if problems:
         raise ConfigError("Invalid configuration:\n  - " + "\n  - ".join(problems))
 
@@ -70,4 +81,5 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         groq_api_key=(env.get("GROQ_API_KEY") or "").strip() or None,
         groq_model=(env.get("GROQ_MODEL") or "").strip() or DEFAULT_GROQ_MODEL,
         groq_fallback_model=(env.get("GROQ_FALLBACK_MODEL") or "").strip() or None,
+        github_user_map=user_map,
     )

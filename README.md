@@ -13,10 +13,12 @@ The bot connects out to Discord, so it needs no open ports and runs fine behind 
 | Command | Who | What it does |
 |---|---|---|
 | `/issue create title [body]` | role | Creates an issue and replies with its link |
-| `/issue list [state] [label]` | everyone | Lists up to 10 issues. `state` is `open` (default), `closed` or `all`. `label` filters by label |
+| `/issue list [state] [label]` | everyone | Lists issues, 20 per page, with ◀ ▶ buttons when there is more. `state` is `open` (default), `closed` or `all`. `label` filters by label |
 | `/issue view number` | everyone | Shows one issue: title, state, author, labels and the start of its description |
 | `/issue close number` | role | Closes an issue |
 | `/issue comment number body` | role | Adds a comment to an issue |
+| `/issue assign number user` | role | Assigns a GitHub user to an issue (adds them, existing assignees stay) |
+| `/issue unassign number user` | role | Removes a GitHub user from an issue |
 
 Examples:
 
@@ -26,9 +28,46 @@ Examples:
 /issue view number: 12
 /issue close number: 12
 /issue comment number: 12  body: Fixed in the next release
+/issue assign number: 12  user: zinbac000
+/issue unassign number: 12  user: zinbac000
 ```
 
+`user` is a GitHub username that the repo can assign. The bot checks that, and only says "assigned" once GitHub confirms the person is on the issue (GitHub itself silently ignores people it cannot assign).
+
 Pull requests are not issues: the bot skips them in lists and refuses to view or close them.
+
+Long lists are paged: 20 issues per page, newest first. When there are more, the page footer says so and ◀ ▶ buttons appear under it. Only the person who ran the command can use the buttons, and they stop working after 3 minutes (run the command again). The same goes for "list open bugs" in plain language.
+
+### Several issues at once
+
+`/bulk action targets [value]` works on many issues in one go, and so does plain language ("close 12, 15 and 20-22"). There is no limit on how many issues you can name.
+
+| `action` | `targets` | `value` |
+|---|---|---|
+| `view` | issue numbers | |
+| `create` | titles separated by `;` | |
+| `close` | issue numbers | |
+| `comment` | issue numbers | the comment text |
+| `assign` / `unassign` | issue numbers | a GitHub username |
+
+Numbers can be a list, a range, or both: `12, 15, 20-22`. `view` is open to everyone, every other action needs the role.
+
+```
+/bulk action: close  targets: 12, 15, 20-22
+/bulk action: create  targets: Fix login; Add dark mode; Write the README
+/bulk action: assign  targets: 3-6  value: zinbac000
+@bot gán issue 10, 11 và 12 cho zinbac000
+```
+
+How it behaves:
+
+- You always get **one preview** that starts with the count and the action ("Close 7 issues?"), then lists every issue with its real title. Nothing changes until you press **Confirm** once. This applies to slash commands too.
+- The bot runs exactly the list you saw, one issue at a time with a short pause, and re-checks each issue just before changing it. An issue that is already in the wanted state (for example already closed) or is now a pull request is skipped and reported.
+- If one issue fails, the rest still run. At the end you get a summary (ok, skipped, failed, unknown, not attempted) and, for the failures, a list of numbers to retry. Long previews and reports come as an attached file.
+- If GitHub rate limits or refuses the bot, the run stops and the remaining issues are marked "not attempted".
+- Creating is never retried: if a create times out, the bot says the outcome is unknown, because the issue may exist. Check the issue list before creating it again.
+- The numbers must be written by you. In plain language, if the AI's list differs in any way from what you typed (one more, one fewer), the bot asks instead of guessing. There is no "all issues with label X" yet.
+- A very long run takes about one second per issue. Discord only lets the bot edit its reply for 15 minutes after the command, so after roughly 900 issues the final summary may not be shown. The bot logs every item either way.
 
 ### Plain language (needs a Groq key, see [Natural language](#natural-language-groq))
 
@@ -40,7 +79,13 @@ Use `/ask`, or tag the bot in any message:
 @bot list closed bugs
 @bot đóng issue 12
 @bot comment on 12: fixed in the next release
+@bot gán issue 12 cho zinbac000
+@bot assign 12 to me
+@bot assign 12 to @teammate
+@bot bỏ gán 12 cho zinbac000
 ```
+
+"Me" and `@mention` only work for people listed in `GITHUB_USER_MAP` (see below). For anyone else, type their GitHub username. The bot never guesses who you mean.
 
 - Reading (list, view) happens right away.
 - Writing (create, close, comment) first shows a preview with **Confirm** and **Cancel** buttons. Nothing changes on GitHub until you press Confirm. Only you can press the buttons, they work once, and they expire after 2 minutes.
@@ -77,6 +122,7 @@ cp .env.example .env     # Windows: copy .env.example .env
 | `ALLOWED_ROLE_ID` | Role ID (a number) allowed to write |
 | `DISCORD_GUILD_ID` | Optional. Your server ID. Without it, new commands can take up to an hour to appear |
 | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_FALLBACK_MODEL` | Optional, for plain language |
+| `GITHUB_USER_MAP` | Optional. Comma-separated `<discord user id>=<github login>` pairs, for example `123456789=zinbac000,987654321=octocat`. Lets people say "assign to me" or tag a teammate. You edit it yourself, there is no self-service linking |
 
 `.env` is ignored by git. Never commit it.
 
@@ -152,6 +198,8 @@ then restart the bot, or run the installer again. It is safe to repeat.
 | "You need the allowed role" | You do not have the role in `ALLOWED_ROLE_ID` |
 | "The AI model is unavailable" | Groq retired the model. Pick a current one and update `GROQ_MODEL` |
 | Tagging does nothing | Message Content Intent is off in the Developer Portal, or `GROQ_API_KEY` is empty |
+| "X cannot be assigned in this repo" | The person is not a collaborator on the repo. Only collaborators (and the owner) can be assigned |
+| "I don't know which GitHub account that is" | "Me" or a mention for someone missing from `GITHUB_USER_MAP`. Type their GitHub username, or add them to the map |
 | "#N is a pull request, not an issue" | The number belongs to a pull request. The bot only handles issues |
 
 After changing `.env`, restart the bot.

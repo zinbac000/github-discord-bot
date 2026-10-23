@@ -5,15 +5,17 @@ from typing import Literal
 import discord
 from discord import app_commands
 
-from .ask import HINT, Limiter, handle_text
+from .ask import HINT, Limiter, handle_text, submit
+from .bulk import build_intent
 from .config import Settings
 from .github import GitHubClient, GitHubError
 from .intent import GroqClient
-from .render import issue_line, list_embed, view_embed
+from .listing import first_page
+from .render import issue_line, view_embed
+from .targets import BulkInputError
 
 log = logging.getLogger(__name__)
 
-LIST_LIMIT = 10
 
 
 class NotAllowed(app_commands.CheckFailure):
@@ -52,11 +54,12 @@ def make_issue_group(gh: GitHubClient, role_id: int) -> app_commands.Group:
         label: str | None = None,
     ):
         await interaction.response.defer()
-        issues = await gh.list_issues(state=state, label=label, limit=LIST_LIMIT)
-        if not issues:
-            await interaction.followup.send(f"No {state} issues found.")
-            return
-        await interaction.followup.send(embed=list_embed(issues, state))
+        content, embed, view = await first_page(
+            gh, state, label, interaction.user.id, f"No {state} issues found."
+        )
+        message = await interaction.followup.send(**_send_kwargs(content, embed, view))
+        if view is not None:
+            view.message = message
 
     @group.command(name="view", description="Show one issue")
     @app_commands.describe(number="Issue number")
@@ -81,6 +84,24 @@ def make_issue_group(gh: GitHubClient, role_id: int) -> app_commands.Group:
         url = await gh.comment(number, body)
         await interaction.followup.send(f"Commented on #{number}: {url}")
 
+    @group.command(name="assign", description="Assign a GitHub user to an issue")
+    @app_commands.describe(number="Issue number", user="GitHub username")
+    @write
+    async def assign(interaction: discord.Interaction, number: int, user: str):
+        await interaction.response.defer()
+        issue = await gh.assign(number, user)
+        await interaction.followup.send(f"Assigned {user.strip().lstrip('@')} to {issue_line(issue)}")
+
+    @group.command(name="unassign", description="Remove a GitHub user from an issue")
+    @app_commands.describe(number="Issue number", user="GitHub username")
+    @write
+    async def unassign(interaction: discord.Interaction, number: int, user: str):
+        await interaction.response.defer()
+        issue = await gh.unassign(number, user)
+        await interaction.followup.send(
+            f"Unassigned {user.strip().lstrip('@')} from {issue_line(issue)}"
+        )
+
     return group
 
 
@@ -103,9 +124,9 @@ async def on_command_error(interaction: discord.Interaction, error: app_commands
         log.exception("Could not deliver error message")
 
 
-def _send_kwargs(content, embed, view) -> dict:
+def _send_kwargs(content, embed, view, file=None) -> dict:
     """Only pass what is set: discord.py rejects some explicit Nones."""
-    given = {"content": content, "embed": embed, "view": view}
+    given = {"content": content, "embed": embed, "view": view, "file": file}
     return {key: value for key, value in given.items() if value is not None}
 
 
@@ -126,6 +147,7 @@ class IssueBot(discord.Client):
             guild=self._guild(),
         )
         self.tree.error(on_command_error)
+        self._add_bulk_command()
         if settings.groq_api_key:
             self.groq = GroqClient(
                 settings.groq_api_key, settings.groq_model, settings.groq_fallback_model
@@ -135,6 +157,44 @@ class IssueBot(discord.Client):
     def _guild(self) -> discord.Object | None:
         guild_id = self._settings.discord_guild_id
         return discord.Object(id=guild_id) if guild_id else None
+
+    def _add_bulk_command(self) -> None:
+        @self.tree.command(
+            name="bulk", description="Act on several issues at once", guild=self._guild()
+        )
+        @app_commands.describe(
+            action="What to do",
+            targets="Issue numbers like 12, 15, 20-22 (for create: titles separated by ;)",
+            value="Comment text, or the GitHub username to assign or unassign",
+        )
+        async def bulk(
+            interaction: discord.Interaction,
+            action: Literal["view", "create", "close", "comment", "assign", "unassign"],
+            targets: str,
+            value: str = "",
+        ):
+            await interaction.response.defer(ephemeral=True)
+
+            async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
+                return await interaction.followup.send(
+                    **_send_kwargs(content, embed, view, file), ephemeral=True
+                )
+
+            try:
+                intent = build_intent(action, targets, value)
+            except BulkInputError as exc:
+                await reply(content=str(exc))
+                return
+            await submit(
+                intent=intent,
+                text=f"/bulk {action} {targets} {value}".strip(),
+                user_id=interaction.user.id,
+                role_ids=[role.id for role in getattr(interaction.user, "roles", [])],
+                role_id=self._settings.allowed_role_id,
+                gh=self.github,
+                reply=reply,
+                user_map=self._settings.github_user_map,
+            )
 
     def _add_ask_command(self) -> None:
         # Every /ask reply is private to the asker: after a defer Discord fixes the
@@ -146,9 +206,9 @@ class IssueBot(discord.Client):
         async def ask(interaction: discord.Interaction, text: str):
             await interaction.response.defer(ephemeral=True)
 
-            async def reply(content=None, embed=None, view=None, ephemeral=False):
+            async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
                 return await interaction.followup.send(
-                    **_send_kwargs(content, embed, view), ephemeral=True
+                    **_send_kwargs(content, embed, view, file), ephemeral=True
                 )
 
             await handle_text(
@@ -160,6 +220,7 @@ class IssueBot(discord.Client):
                 groq=self.groq,
                 limiter=self.limiter,
                 reply=reply,
+                user_map=self._settings.github_user_map,
             )
 
     async def setup_hook(self) -> None:
@@ -176,9 +237,9 @@ class IssueBot(discord.Client):
             await message.reply(HINT, mention_author=False)
             return
 
-        async def reply(content=None, embed=None, view=None, ephemeral=False):
+        async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
             # A message reply cannot be ephemeral.
-            return await message.reply(**_send_kwargs(content, embed, view), mention_author=False)
+            return await message.reply(**_send_kwargs(content, embed, view, file), mention_author=False)
 
         try:
             await handle_text(
@@ -190,6 +251,7 @@ class IssueBot(discord.Client):
                 groq=self.groq,
                 limiter=self.limiter,
                 reply=reply,
+                user_map=self._settings.github_user_map,
             )
         except Exception:
             log.exception("Unhandled error while handling a mention")

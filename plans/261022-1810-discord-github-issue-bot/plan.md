@@ -74,6 +74,8 @@ README.md
 | 4 | [Service install and docs](phase-04-service-install-and-docs.md) | code done, live check pending | 3 |
 | 5 | [Groq intent parser](phase-05-groq-intent-parser.md) | code done, live check pending | 3 |
 | 6 | [/ask command, mentions and confirmation](phase-06-ask-command-and-mentions.md) | code done, live check pending | 5 |
+| 7 | [Assign and unassign issues](phase-07-assign-unassign.md) | code done, live check pending | 6 |
+| 8 | [Bulk actions](phase-08-bulk-actions.md) | code done, live check pending | 7 |
 
 Phase 3 delivers `create` and `list` first (the two commands named in the contract), then `view`, `close`, `comment`.
 

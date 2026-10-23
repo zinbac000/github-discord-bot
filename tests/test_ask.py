@@ -30,7 +30,7 @@ def issue(number=3, title="Login bug", state="open"):
 def gh():
     return MagicMock(
         create_issue=AsyncMock(return_value=issue(5, "New")),
-        list_issues=AsyncMock(return_value=[issue(1), issue(2)]),
+        list_issues=AsyncMock(return_value=([issue(1), issue(2)], False)),
         get_issue=AsyncMock(return_value=issue(3)),
         close_issue=AsyncMock(return_value=issue(3, state="closed")),
         comment=AsyncMock(return_value="https://github.com/o/r/issues/3#c"),
@@ -42,10 +42,10 @@ def groq_returning(intent=None, error=None):
     return SimpleNamespace(parse=parse)
 
 
-async def run(gh, groq, *, roles=(ROLE,), user=OWNER, limiter=None):
+async def run(gh, groq, *, roles=(ROLE,), user=OWNER, limiter=None, text="whatever", user_map=None):
     reply = AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))
     await handle_text(
-        text="whatever",
+        text=text,
         user_id=user,
         role_ids=roles,
         role_id=ROLE,
@@ -53,6 +53,7 @@ async def run(gh, groq, *, roles=(ROLE,), user=OWNER, limiter=None):
         groq=groq,
         limiter=limiter or Limiter(),
         reply=reply,
+        user_map=user_map,
     )
     return reply
 
@@ -74,13 +75,13 @@ CREATE = Intent("create", title="Login lỗi", body="trên Safari", lang="vi")
 
 async def test_read_runs_immediately_without_view(gh):
     reply = await run(gh, groq_returning(Intent("list", state="closed", label="bug")))
-    gh.list_issues.assert_awaited_once_with(state="closed", label="bug", limit=10)
+    gh.list_issues.assert_awaited_once_with("closed", "bug", page=1)
     assert "view" not in reply.await_args.kwargs
     assert reply.await_args.kwargs["embed"] is not None
 
 
 async def test_empty_list_says_so(gh):
-    gh.list_issues.return_value = []
+    gh.list_issues.return_value = ([], False)
     reply = await run(gh, groq_returning(Intent("list")))
     assert "No open issues" in reply.await_args.kwargs["content"]
 
@@ -305,3 +306,96 @@ async def test_mention_failure_still_replies():
     await bot.on_message(msg)
     assert "wrong" in msg.reply.await_args.args[0]
     await bot.close()
+
+
+def assign_gh(gh, assignees=()):
+    gh.get_issue = AsyncMock(
+        return_value=Issue(3, "Login bug", "open", "https://github.com/o/r/issues/3", [], "alice", "b", list(assignees))
+    )
+    gh.assignable_login = AsyncMock(return_value="Zinbac000")
+    gh.assign = AsyncMock(return_value=issue(3))
+    gh.unassign = AsyncMock(return_value=issue(3))
+    return gh
+
+
+MAP = {OWNER: "zinbac000", 8: "octocat"}
+
+
+async def test_assign_preview_shows_title_login_and_current_assignees(gh):
+    assign_gh(gh, ["octocat"])
+    intent = Intent("assign", number=3, assignee_kind="login", assignee="zinbac000")
+    reply = await run(gh, groq_returning(intent), text="assign 3 to zinbac000")
+    description = reply.await_args.kwargs["embed"].description
+    assert "#3: Login bug" in description and "Zinbac000" in description and "octocat" in description
+    gh.assign.assert_not_awaited()
+
+
+async def test_assign_confirm_assigns_once_and_rechecks_role(gh):
+    assign_gh(gh)
+    intent = Intent("assign", number=3, assignee_kind="login", assignee="zinbac000", lang="vi")
+    view = view_from(await run(gh, groq_returning(intent), text="gán 3 cho zinbac000"))
+    await view.confirm.callback(press())
+    gh.assign.assert_awaited_once_with(3, "zinbac000")
+
+    view = view_from(await run(gh, groq_returning(intent), text="gán 3 cho zinbac000"))
+    await view.confirm.callback(press(role_ids=()))
+    gh.assign.assert_awaited_once()  # the second press lost its role and wrote nothing
+
+
+async def test_me_resolves_through_the_map(gh):
+    assign_gh(gh)
+    reply = await run(gh, groq_returning(Intent("assign", number=3, assignee_kind="self")), text="assign 3 to me", user_map=MAP)
+    assert isinstance(view_from(reply), ConfirmView)
+    assert view_from(reply).intent.assignee == "zinbac000"
+
+
+async def test_me_from_an_unmapped_caller_is_refused_and_asks_for_a_login(gh):
+    assign_gh(gh)
+    reply = await run(gh, groq_returning(Intent("assign", number=3, assignee_kind="self")), text="assign 3 to me", user_map={})
+    assert "GitHub" in reply.await_args.kwargs["content"]
+    assert "view" not in reply.await_args.kwargs
+    gh.assign.assert_not_awaited()
+
+
+async def test_mention_resolves_through_the_map_and_unmapped_mentions_are_refused(gh):
+    assign_gh(gh)
+    mentioned = Intent("assign", number=3, assignee_kind="mention")
+    reply = await run(gh, groq_returning(mentioned), text="assign 3 to <@8>", user_map=MAP)
+    assert view_from(reply).intent.assignee == "octocat"
+    reply = await run(gh, groq_returning(mentioned), text="assign 3 to <@999>", user_map=MAP)
+    assert "view" not in reply.await_args.kwargs
+    reply = await run(gh, groq_returning(mentioned), text="assign 3 to <@8> and <@9>", user_map=MAP)
+    assert "view" not in reply.await_args.kwargs
+
+
+async def test_assign_without_the_role_is_refused_before_resolution(gh):
+    assign_gh(gh)
+    intent = Intent("assign", number=3, assignee_kind="login", assignee="zinbac000")
+    reply = await run(gh, groq_returning(intent), roles=(), text="assign 3 to zinbac000")
+    assert "role" in reply.await_args.kwargs["content"]
+    gh.get_issue.assert_not_awaited()
+
+
+async def test_unassign_of_someone_not_assigned_is_reported_without_a_preview(gh):
+    assign_gh(gh, ["octocat"])
+    intent = Intent("unassign", number=3, assignee_kind="login", assignee="zinbac000")
+    reply = await run(gh, groq_returning(intent), text="unassign 3 from zinbac000")
+    assert "is not assigned" in reply.await_args.kwargs["content"]
+    assert "view" not in reply.await_args.kwargs
+
+
+async def test_unassign_confirm_unassigns(gh):
+    assign_gh(gh, ["zinbac000"])
+    intent = Intent("unassign", number=3, assignee_kind="login", assignee="zinbac000")
+    view = view_from(await run(gh, groq_returning(intent), text="unassign 3 from zinbac000"))
+    await view.confirm.callback(press())
+    gh.unassign.assert_awaited_once_with(3, "zinbac000")
+
+
+async def test_assign_to_a_user_the_repo_cannot_assign_is_reported(gh):
+    assign_gh(gh)
+    gh.assignable_login.return_value = None
+    intent = Intent("assign", number=3, assignee_kind="login", assignee="stranger")
+    reply = await run(gh, groq_returning(intent), text="assign 3 to stranger")
+    assert "cannot be assigned" in reply.await_args.kwargs["content"]
+    assert "view" not in reply.await_args.kwargs

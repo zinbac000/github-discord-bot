@@ -61,3 +61,15 @@ def test_groq_values_are_read():
 
 def test_empty_groq_key_means_disabled():
     assert load_settings({**VALID, "GROQ_API_KEY": "  "}).groq_api_key is None
+
+
+def test_user_map_is_parsed():
+    s = load_settings({**VALID, "GITHUB_USER_MAP": "111=zinbac000, 222=@octocat"})
+    assert s.github_user_map == {111: "zinbac000", 222: "octocat"}
+    assert load_settings(VALID).github_user_map == {}
+
+
+@pytest.mark.parametrize("raw", ["abc=zinbac000", "111", "111=", "111=bad login", "111=../x"])
+def test_malformed_user_map_is_rejected(raw):
+    with pytest.raises(ConfigError, match="GITHUB_USER_MAP"):
+        load_settings({**VALID, "GITHUB_USER_MAP": raw})
