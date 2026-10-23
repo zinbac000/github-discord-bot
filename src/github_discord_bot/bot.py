@@ -5,7 +5,7 @@ from typing import Literal
 import discord
 from discord import app_commands
 
-from .ask import HINT, Limiter, handle_text, submit
+from .ask import HINT, Limiter, handle_text, resolve_person, submit
 from .bulk import build_intent
 from .config import Settings
 from .github import GitHubClient, GitHubError
@@ -34,7 +34,9 @@ def role_gate(role_id: int):
     return app_commands.check(predicate)
 
 
-def make_issue_group(gh: GitHubClient, role_id: int) -> app_commands.Group:
+def make_issue_group(
+    gh: GitHubClient, role_id: int, user_map: dict[int, str] | None = None
+) -> app_commands.Group:
     group = app_commands.Group(name="issue", description="Manage GitHub issues")
     write = role_gate(role_id)
 
@@ -89,18 +91,18 @@ def make_issue_group(gh: GitHubClient, role_id: int) -> app_commands.Group:
     @write
     async def assign(interaction: discord.Interaction, number: int, user: str):
         await interaction.response.defer()
-        issue = await gh.assign(number, user)
-        await interaction.followup.send(f"Assigned {user.strip().lstrip('@')} to {issue_line(issue)}")
+        login = resolve_person(user, interaction.user.id, user_map or {})
+        issue = await gh.assign(number, login)
+        await interaction.followup.send(f"Assigned {login} to {issue_line(issue)}")
 
     @group.command(name="unassign", description="Remove a GitHub user from an issue")
     @app_commands.describe(number="Issue number", user="GitHub username")
     @write
     async def unassign(interaction: discord.Interaction, number: int, user: str):
         await interaction.response.defer()
-        issue = await gh.unassign(number, user)
-        await interaction.followup.send(
-            f"Unassigned {user.strip().lstrip('@')} from {issue_line(issue)}"
-        )
+        login = resolve_person(user, interaction.user.id, user_map or {})
+        issue = await gh.unassign(number, login)
+        await interaction.followup.send(f"Unassigned {login} from {issue_line(issue)}")
 
     return group
 
@@ -143,7 +145,7 @@ class IssueBot(discord.Client):
         self.limiter = Limiter()
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(
-            make_issue_group(self.github, settings.allowed_role_id),
+            make_issue_group(self.github, settings.allowed_role_id, settings.github_user_map),
             guild=self._guild(),
         )
         self.tree.error(on_command_error)
@@ -181,9 +183,14 @@ class IssueBot(discord.Client):
                 )
 
             try:
+                if action in ("assign", "unassign"):
+                    value = resolve_person(value, interaction.user.id, self._settings.github_user_map)
                 intent = build_intent(action, targets, value)
             except BulkInputError as exc:
                 await reply(content=str(exc))
+                return
+            except GitHubError as exc:
+                await reply(content=exc.message)
                 return
             await submit(
                 intent=intent,

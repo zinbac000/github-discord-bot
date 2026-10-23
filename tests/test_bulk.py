@@ -359,3 +359,16 @@ async def test_slash_bulk_previews_for_a_role_member_and_refuses_others():
     bad = await slash(bot, action="close", targets="20-12", value="")
     assert "backwards" in bad.followup.send.await_args.kwargs["content"]
     await bot.close()
+
+
+async def test_slash_bulk_assign_resolves_a_mention_and_me_through_the_map():
+    bot = IssueBot(Settings("d", "g", "o/r", ROLE, github_user_map={OWNER: "zinbac000", 8: "octocat"}))
+    bot._connection.user = SimpleNamespace(id=999)
+    bot.github = make_gh({1: issue(1), 2: issue(2)})
+    for who, expected in (("<@8>", "octocat"), ("me", "zinbac000")):
+        done = await slash(bot, action="assign", targets="1, 2", value=who)
+        view = done.followup.send.await_args.kwargs["view"]
+        assert view.intent.assignee == expected
+    unknown = await slash(bot, action="assign", targets="1, 2", value="<@999>")
+    assert "GITHUB_USER_MAP" in unknown.followup.send.await_args.kwargs["content"]
+    await bot.close()

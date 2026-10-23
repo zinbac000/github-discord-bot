@@ -173,6 +173,32 @@ async def run_write(gh: GitHubClient, intent: Intent) -> str:
     return m["commented"].format(number=intent.number, url=url)
 
 
+_SELF_WORDS = {"me", "myself", "tôi", "tui", "mình"}
+
+
+def resolve_person(raw: str, user_id: int, user_map: dict[int, str]) -> str:
+    """The GitHub login for what someone typed in a slash command option.
+
+    That can be a GitHub login ("zinbac000" or "@zinbac000"), "me", or a Discord mention:
+    Discord sends a picked user as "<@123>", which GitHub knows nothing about, so it goes
+    through GITHUB_USER_MAP. Raises GitHubError when a mention or "me" has no entry.
+    """
+    raw = raw.strip()
+    mention = re.fullmatch(r"<@!?(\d+)>", raw)
+    if mention:
+        login = user_map.get(int(mention.group(1)))
+    elif raw.lstrip("@").lower() in _SELF_WORDS:
+        login = user_map.get(user_id)
+    else:
+        return raw.lstrip("@")
+    if login is None:
+        raise GitHubError(
+            "I don't know which GitHub account that is. Type their GitHub username, "
+            "or add them to GITHUB_USER_MAP."
+        )
+    return login
+
+
 def resolve_assignee(
     intent: Intent, text: str, user_id: int, user_map: dict[int, str]
 ) -> str | None:

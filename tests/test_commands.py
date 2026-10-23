@@ -132,7 +132,46 @@ async def test_assign_and_unassign_reply_with_the_person(group, gh):
     gh.unassign = AsyncMock(return_value=issue(3))
     i = interaction()
     await cmd(group, "assign").callback(i, 3, "@zinbac000")
-    gh.assign.assert_awaited_once_with(3, "@zinbac000")
+    gh.assign.assert_awaited_once_with(3, "zinbac000")
     assert "Assigned zinbac000" in i.followup.send.await_args.args[0]
     await cmd(group, "unassign").callback(i, 3, "zinbac000")
     assert "Unassigned zinbac000" in i.followup.send.await_args.args[0]
+
+
+MAP = {7: "zinbac000", 8: "octocat"}
+
+
+async def test_assign_with_a_discord_mention_goes_through_the_user_map(gh):
+    group = make_issue_group(gh, ROLE, MAP)
+    gh.assign = AsyncMock(return_value=issue(3))
+    gh.unassign = AsyncMock(return_value=issue(3))
+    i = interaction()
+    await cmd(group, "assign").callback(i, 3, "<@8>")
+    gh.assign.assert_awaited_once_with(3, "octocat")
+    assert "Assigned octocat" in i.followup.send.await_args.args[0]
+    await cmd(group, "unassign").callback(i, 3, "<@!8>")
+    gh.unassign.assert_awaited_once_with(3, "octocat")
+
+
+async def test_assign_to_me_uses_the_callers_entry_in_the_map(gh):
+    group = make_issue_group(gh, ROLE, MAP)
+    gh.assign = AsyncMock(return_value=issue(3))
+    await cmd(group, "assign").callback(interaction(), 3, "me")
+    gh.assign.assert_awaited_once_with(3, "zinbac000")
+
+
+async def test_a_mention_or_me_missing_from_the_map_explains_how_to_fix_it(gh):
+    group = make_issue_group(gh, ROLE, MAP)
+    gh.assign = AsyncMock()
+    for who in ("<@999>", "<@!999>"):
+        with pytest.raises(GitHubError, match="GITHUB_USER_MAP"):
+            await cmd(group, "assign").callback(interaction(), 3, who)
+    with pytest.raises(GitHubError, match="GITHUB_USER_MAP"):
+        await make_issue_group(gh, ROLE, {}).get_command("assign").callback(interaction(), 3, "me")
+    gh.assign.assert_not_awaited()
+
+
+async def test_a_plain_login_still_works_with_or_without_the_map(gh):
+    gh.assign = AsyncMock(return_value=issue(3))
+    await cmd(make_issue_group(gh, ROLE), "assign").callback(interaction(), 3, "@someone")
+    gh.assign.assert_awaited_once_with(3, "someone")
