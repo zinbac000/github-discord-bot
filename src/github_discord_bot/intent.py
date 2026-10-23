@@ -136,7 +136,10 @@ def validate_intent(intent: Intent, user_text: str) -> Intent:
         n = intent.number
         typed = n is not None and re.search(rf"(?<!\d){n}(?!\d)", user_text)
         # Several different numbers in one message is ambiguous: ask, never guess.
-        if not typed or len(set(re.findall(r"(?<!\d)\d+(?!\d)", user_text))) > 1:
+        # Digits glued to letters ("e2e", "v2") are not issue numbers, and a comment's
+        # own text may mention numbers, so leave it out of the count.
+        scope = user_text.replace(intent.body, "") if intent.action == "comment" and intent.body else user_text
+        if not typed or len(set(re.findall(r"(?<!\w)\d+(?!\w)", scope))) > 1:
             return Intent(action="clarify", question=_ASK_NUMBER[lang], lang=lang)
 
     if intent.action == "create":

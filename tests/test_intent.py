@@ -167,3 +167,12 @@ async def test_blank_clarify_question_gets_a_default_and_long_ones_are_clipped(g
 def test_several_distinct_numbers_become_clarify():
     assert validate_intent(Intent("close", number=15), "close 12 not 15").action == "clarify"
     assert validate_intent(Intent("close", number=12), "close 12 and 12 again").action == "close"
+
+
+def test_digits_inside_words_or_a_comment_body_are_not_extra_issue_numbers():
+    ok = validate_intent(Intent("comment", number=1, body="kiểm thử e2e ok"), "bình luận vào issue 1: kiểm thử e2e ok")
+    assert ok.action == "comment"
+    ok = validate_intent(Intent("comment", number=12, body="fixed in 2 days, see 15"), "comment on 12: fixed in 2 days, see 15")
+    assert ok.action == "comment"
+    assert validate_intent(Intent("view", number=12), "view 12 (v2 build)").action == "view"
+    assert validate_intent(Intent("close", number=15), "close 12 not 15").action == "clarify"
