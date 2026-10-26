@@ -1,4 +1,6 @@
 import re
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import httpx
@@ -8,6 +10,8 @@ LOGIN_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 PAGE_SIZE = 20
 FETCH_SIZE = 100  # GitHub items per request while filling a page
 MAX_FETCHES = 10  # most GitHub requests spent on one page of results
+LABEL_CACHE_SECONDS = 600
+MAX_LABEL_PAGES = 10
 
 
 class GitHubError(Exception):
@@ -71,8 +75,18 @@ def _error_for(status: int) -> GitHubError:
 
 
 class GitHubClient:
-    def __init__(self, token: str, repo: str, *, timeout: float = 15.0):
+    def __init__(
+        self,
+        token: str,
+        repo: str,
+        *,
+        timeout: float = 15.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self._repo = repo
+        self._clock = clock
+        self._labels: list[str] = []
+        self._labels_at: float | None = None
         self._http = httpx.AsyncClient(
             base_url=API,
             timeout=timeout,
@@ -87,14 +101,17 @@ class GitHubClient:
     async def aclose(self) -> None:
         await self._http.aclose()
 
-    async def _send(self, method: str, path: str, **kwargs) -> httpx.Response:
+    async def _call(self, method: str, url: str, **kwargs) -> httpx.Response:
         try:
-            response = await self._http.request(method, f"/repos/{self._repo}{path}", **kwargs)
+            response = await self._http.request(method, url, **kwargs)
         except httpx.HTTPError:
             raise GitHubError("Could not reach GitHub. Try again in a moment.") from None
         if response.is_error:
             raise _error_for(response.status_code)
         return response
+
+    async def _send(self, method: str, path: str, **kwargs) -> httpx.Response:
+        return await self._call(method, f"/repos/{self._repo}{path}", **kwargs)
 
     async def _request(self, method: str, path: str, **kwargs):
         return (await self._send(method, path, **kwargs)).json()
@@ -106,6 +123,34 @@ class GitHubClient:
         if labels:
             payload["labels"] = labels
         return _issue(await self._request("POST", "/issues", json=payload))
+
+    async def list_labels(self) -> list[str]:
+        """Every label name on the repo. Cached for ten minutes, so one preview costs no request."""
+        now = self._clock()
+        if self._labels_at is not None and now - self._labels_at < LABEL_CACHE_SECONDS:
+            return list(self._labels)
+        names: list[str] = []
+        for page in range(1, MAX_LABEL_PAGES + 1):
+            response = await self._send("GET", "/labels", params={"per_page": 100, "page": page})
+            names += [label["name"] for label in response.json()]
+            if "next" not in response.links:
+                break
+        self._labels, self._labels_at = names, now
+        return list(names)
+
+    async def search_issues(self, query: str, limit: int = 3) -> list[Issue]:
+        """Issues (never pull requests, open or closed) that best match the words in `query`."""
+        response = await self._call(
+            "GET",
+            "/search/issues",
+            params={
+                "q": f"repo:{self._repo} is:issue {query}",
+                "per_page": limit + 2,
+                "sort": "best-match",
+            },
+        )
+        items = [i for i in response.json().get("items", []) if "pull_request" not in i]
+        return [_issue(i) for i in items[:limit]]
 
     async def list_issues(
         self,

@@ -31,6 +31,8 @@ def gh():
         get_issue=AsyncMock(return_value=issue(3)),
         close_issue=AsyncMock(return_value=issue(3, state="closed")),
         comment=AsyncMock(return_value="https://github.com/o/r/issues/3#c"),
+        list_labels=AsyncMock(return_value=["bug", "enhancement", "game:clash-of-saigon"]),
+        search_issues=AsyncMock(return_value=[]),
     )
 
 
@@ -50,7 +52,7 @@ async def passes_checks(command, i):
 async def test_create_replies_with_link(group, gh):
     i = interaction()
     await cmd(group, "create").callback(i, "New", "details")
-    gh.create_issue.assert_awaited_once_with("New", "details")
+    gh.create_issue.assert_awaited_once_with("New", "details", None)
     i.response.defer.assert_awaited_once()
     assert "issues/5" in i.followup.send.await_args.args[0]
 

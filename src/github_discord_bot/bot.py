@@ -5,13 +5,28 @@ from typing import Literal
 import discord
 from discord import app_commands
 
-from .ask import HINT, Limiter, handle_text, resolve_person, submit
+from .ask import (
+    BUSY,
+    HINT,
+    MESSAGES,
+    Limiter,
+    find_similar,
+    handle_text,
+    handle_thread,
+    label_names,
+    present_create,
+    resolve_person,
+    submit,
+)
 from .bulk import build_intent
 from .config import Settings
 from .github import GitHubClient, GitHubError
 from .intent import GroqClient
+from .labels import final_labels, game_labels, match_game, resolve_kind
 from .listing import first_page
+from .quota import CreateQuota
 from .render import issue_line, view_embed
+from .thread_draft import Draft
 from .targets import BulkInputError
 
 log = logging.getLogger(__name__)
@@ -35,18 +50,104 @@ def role_gate(role_id: int):
 
 
 def make_issue_group(
-    gh: GitHubClient, role_id: int, user_map: dict[int, str] | None = None
+    gh: GitHubClient,
+    role_id: int,
+    user_map: dict[int, str] | None = None,
+    *,
+    limiter: Limiter | None = None,
+    quota: CreateQuota | None = None,
+    groq: GroqClient | None = None,
 ) -> app_commands.Group:
     group = app_commands.Group(name="issue", description="Manage GitHub issues")
     write = role_gate(role_id)
+    m = MESSAGES["en"]
 
     @group.command(name="create", description="Create an issue")
-    @app_commands.describe(title="Issue title", body="Issue description")
+    @app_commands.describe(
+        title="Issue title",
+        body="Issue description",
+        kind="Type of issue (an idea is filed as an enhancement)",
+        game="Which game this is about",
+    )
     @write
-    async def create(interaction: discord.Interaction, title: str, body: str = ""):
+    async def create(
+        interaction: discord.Interaction,
+        title: str,
+        body: str = "",
+        kind: Literal["bug", "enhancement", "idea"] | None = None,
+        game: str | None = None,
+    ):
+        user_id = interaction.user.id
+        if limiter is not None and not limiter.check(user_id):
+            await interaction.response.send_message(BUSY, ephemeral=True)
+            return
+        if quota is not None and quota.remaining(user_id) == 0:
+            await interaction.response.send_message(m["capped"], ephemeral=True)
+            return
         await interaction.response.defer()
-        issue = await gh.create_issue(title, body)
-        await interaction.followup.send(f"Created {issue_line(issue)}")
+
+        names = await label_names(gh)
+        matched = match_game(game or "", names or [])
+        if game and names is not None and not matched:
+            await interaction.followup.send(m["unknown_game"], ephemeral=True)
+            return
+        draft = Draft(title=title, kind=resolve_kind(kind or ""), game=matched, description=body)
+
+        similar = await find_similar(gh, title)
+        if similar:  # something like it exists: let the person decide, in the same preview as /ask
+
+            async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
+                return await interaction.followup.send(**_send_kwargs(content, embed, view, file))
+
+            await present_create(
+                gh=gh, draft=draft, names=names, similar=similar, user_id=user_id,
+                role_id=role_id, reply=reply, quota=quota, text=f"/issue create {title}",
+            )
+            return
+
+        if quota is not None and not quota.consume(user_id):
+            await interaction.followup.send(m["capped"], ephemeral=True)
+            return
+        labels = final_labels(draft.kind, draft.game, names or [])
+        issue = await gh.create_issue(title, body, list(labels) or None)
+        note = m["no_labels"] if names is None and (kind or game) else ""
+        await interaction.followup.send(f"Created {issue_line(issue)}{note}")
+
+    @create.autocomplete("game")
+    async def game_choices(interaction: discord.Interaction, current: str):
+        games = game_labels(await label_names(gh) or [])
+        return [
+            app_commands.Choice(name=g[:100], value=g) for g in games if current.lower() in g.lower()
+        ][:25]
+
+    if groq is not None:
+
+        @group.command(name="from-thread", description="Draft an issue from this thread")
+        @write
+        async def from_thread(interaction: discord.Interaction):
+            user_id = interaction.user.id
+            if limiter is not None and not limiter.check(user_id):
+                await interaction.response.send_message(BUSY, ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            thread = interaction.channel if isinstance(interaction.channel, discord.Thread) else None
+
+            async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
+                return await interaction.followup.send(
+                    **_send_kwargs(content, embed, view, file), ephemeral=True
+                )
+
+            await handle_thread(
+                thread=thread,
+                user_id=user_id,
+                role_ids=[role.id for role in getattr(interaction.user, "roles", [])],
+                role_id=role_id,
+                gh=gh,
+                groq=groq,
+                reply=reply,
+                quota=quota,
+                announce=thread.send if thread is not None else None,
+            )
 
     @group.command(name="list", description="List issues")
     @app_commands.describe(state="Which issues to show", label="Only issues with this label")
@@ -142,18 +243,27 @@ class IssueBot(discord.Client):
         self._settings = settings
         self.github = GitHubClient(settings.github_token, settings.github_repo)
         self.groq: GroqClient | None = None
-        self.limiter = Limiter()
-        self.tree = app_commands.CommandTree(self)
-        self.tree.add_command(
-            make_issue_group(self.github, settings.allowed_role_id, settings.github_user_map),
-            guild=self._guild(),
-        )
-        self.tree.error(on_command_error)
-        self._add_bulk_command()
         if settings.groq_api_key:
             self.groq = GroqClient(
                 settings.groq_api_key, settings.groq_model, settings.groq_fallback_model
             )
+        self.limiter = Limiter()
+        self.quota = CreateQuota(settings.create_limit_per_hour)
+        self.tree = app_commands.CommandTree(self)
+        self.tree.add_command(
+            make_issue_group(
+                self.github,
+                settings.allowed_role_id,
+                settings.github_user_map,
+                limiter=self.limiter,
+                quota=self.quota,
+                groq=self.groq,
+            ),
+            guild=self._guild(),
+        )
+        self.tree.error(on_command_error)
+        self._add_bulk_command()
+        if self.groq is not None:
             self._add_ask_command()
 
     def _guild(self) -> discord.Object | None:
@@ -175,6 +285,9 @@ class IssueBot(discord.Client):
             targets: str,
             value: str = "",
         ):
+            if action == "create" and not self.limiter.check(interaction.user.id):
+                await interaction.response.send_message(BUSY, ephemeral=True)
+                return
             await interaction.response.defer(ephemeral=True)
 
             async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
@@ -201,6 +314,7 @@ class IssueBot(discord.Client):
                 gh=self.github,
                 reply=reply,
                 user_map=self._settings.github_user_map,
+                quota=self.quota,
             )
 
     def _add_ask_command(self) -> None:
@@ -212,6 +326,7 @@ class IssueBot(discord.Client):
         @app_commands.describe(text="What you want to do, in Vietnamese or English")
         async def ask(interaction: discord.Interaction, text: str):
             await interaction.response.defer(ephemeral=True)
+            thread = interaction.channel if isinstance(interaction.channel, discord.Thread) else None
 
             async def reply(content=None, embed=None, view=None, ephemeral=False, file=None):
                 return await interaction.followup.send(
@@ -219,6 +334,9 @@ class IssueBot(discord.Client):
                 )
 
             await handle_text(
+                thread=thread,
+                announce=thread.send if thread is not None else None,
+                quota=self.quota,
                 text=text,
                 user_id=interaction.user.id,
                 role_ids=[role.id for role in getattr(interaction.user, "roles", [])],
@@ -250,6 +368,8 @@ class IssueBot(discord.Client):
 
         try:
             await handle_text(
+                thread=message.channel if isinstance(message.channel, discord.Thread) else None,
+                quota=self.quota,
                 text=text,
                 user_id=message.author.id,
                 role_ids=[role.id for role in getattr(message.author, "roles", [])],

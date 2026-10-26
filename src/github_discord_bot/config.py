@@ -8,6 +8,7 @@ from dotenv import dotenv_values
 _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
 DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_CREATE_LIMIT = 20
 
 
 class ConfigError(Exception):
@@ -25,6 +26,7 @@ class Settings:
     groq_model: str = DEFAULT_GROQ_MODEL
     groq_fallback_model: str | None = None
     github_user_map: dict[int, str] = field(default_factory=dict)
+    create_limit_per_hour: int = DEFAULT_CREATE_LIMIT
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -58,6 +60,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         problems.append(f"GITHUB_REPO must look like owner/name, got {github_repo!r}")
     allowed_role_id = number("ALLOWED_ROLE_ID", required=True)
     discord_guild_id = number("DISCORD_GUILD_ID", required=False)
+    create_limit = number("CREATE_LIMIT_PER_HOUR", required=False)
 
     user_map: dict[int, str] = {}
     for pair in filter(None, (p.strip() for p in (env.get("GITHUB_USER_MAP") or "").split(","))):
@@ -82,4 +85,5 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         groq_model=(env.get("GROQ_MODEL") or "").strip() or DEFAULT_GROQ_MODEL,
         groq_fallback_model=(env.get("GROQ_FALLBACK_MODEL") or "").strip() or None,
         github_user_map=user_map,
+        create_limit_per_hour=DEFAULT_CREATE_LIMIT if create_limit is None else create_limit,
     )

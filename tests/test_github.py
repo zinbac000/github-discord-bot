@@ -218,3 +218,85 @@ async def test_unassign_reports_failure_when_the_person_is_still_assigned(client
     respx.delete(f"{BASE}/issues/5/assignees").respond(200, json=raw_issue(5, assignees=[assignee("zinbac000")]))
     with pytest.raises(GitHubError, match="did not unassign"):
         await client.unassign(5, "zinbac000")
+
+
+def label_page(*names):
+    return [{"name": n} for n in names]
+
+
+@respx.mock
+async def test_list_labels_follows_pages_and_is_cached_for_ten_minutes():
+    now = [0.0]
+    client = GitHubClient(TOKEN, REPO, clock=lambda: now[0])
+    route = respx.get(f"{BASE}/labels").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=label_page("bug", "game:clash-of-saigon"),
+                headers={"Link": f'<{BASE}/labels?page=2>; rel="next"'},
+            ),
+            httpx.Response(200, json=label_page("enhancement")),
+        ]
+    )
+    assert await client.list_labels() == ["bug", "game:clash-of-saigon", "enhancement"]
+    assert route.call_count == 2
+    assert route.calls[0].request.url.params["per_page"] == "100"
+
+    now[0] = 599
+    await client.list_labels()
+    assert route.call_count == 2  # still cached
+
+    now[0] = 601
+    route.mock(side_effect=None, return_value=httpx.Response(200, json=label_page("bug")))
+    assert await client.list_labels() == ["bug"]
+    await client.aclose()
+
+
+@respx.mock
+async def test_list_labels_error_is_a_github_error_and_not_cached(client):
+    route = respx.get(f"{BASE}/labels").mock(
+        side_effect=[httpx.Response(403), httpx.Response(200, json=label_page("bug"))]
+    )
+    with pytest.raises(GitHubError):
+        await client.list_labels()
+    assert await client.list_labels() == ["bug"]
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_create_issue_sends_labels_only_when_given(client):
+    route = respx.post(f"{BASE}/issues").respond(201, json=raw_issue(1))
+    await client.create_issue("a", "b", ["bug", "game:x"])
+    await client.create_issue("c", "d")
+    assert json.loads(route.calls[0].request.content)["labels"] == ["bug", "game:x"]
+    assert "labels" not in json.loads(route.calls[1].request.content)
+
+
+@respx.mock
+async def test_search_issues_scopes_to_the_repo_and_drops_pull_requests(client):
+    route = respx.get("https://api.github.com/search/issues").respond(
+        200,
+        json={
+            "items": [
+                raw_issue(1, "first"),
+                raw_issue(2, "a pr", pull_request={"url": "x"}),
+                raw_issue(3, "third", state="closed"),
+                raw_issue(4, "fourth"),
+                raw_issue(5, "fifth"),
+            ]
+        },
+    )
+    found = await client.search_issues("login crash")
+    assert [i.number for i in found] == [1, 3, 4]
+    assert found[1].state == "closed"
+    params = route.calls[0].request.url.params
+    assert params["q"] == f"repo:{REPO} is:issue login crash"
+    assert params["sort"] == "best-match"
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [403, 422, 500])
+async def test_search_errors_are_github_errors(client, status):
+    respx.get("https://api.github.com/search/issues").respond(status)
+    with pytest.raises(GitHubError):
+        await client.search_issues("login crash")

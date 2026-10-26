@@ -12,18 +12,19 @@ The bot connects out to Discord, so it needs no open ports and runs fine behind 
 
 | Command | Who | What it does |
 |---|---|---|
-| `/issue create title [body]` | role | Creates an issue and replies with its link |
+| `/issue create title [body] [kind] [game]` | role | Creates an issue and replies with its link. `kind` is `bug`, `enhancement` or `idea`, `game` is picked from the repo's `game:*` labels. If a similar issue already exists, it shows a preview first |
 | `/issue list [state] [label]` | everyone | Lists issues, 20 per page, with ◀ ▶ buttons when there is more. `state` is `open` (default), `closed` or `all`. `label` filters by label |
 | `/issue view number` | everyone | Shows one issue: title, state, author, labels and the start of its description |
 | `/issue close number` | role | Closes an issue |
 | `/issue comment number body` | role | Adds a comment to an issue |
 | `/issue assign number user` | role | Assigns a GitHub user to an issue (adds them, existing assignees stay) |
 | `/issue unassign number user` | role | Removes a GitHub user from an issue |
+| `/issue from-thread` | role | Run inside a thread or forum post: drafts an issue from the discussion (needs a Groq key, see [Create from a thread](#create-from-a-thread)) |
 
 Examples:
 
 ```
-/issue create title: Login fails on Safari  body: Happens after the 2.3 update
+/issue create title: Login fails on Safari  body: Happens after the 2.3 update  kind: bug  game: game:clash-of-saigon
 /issue list state: closed  label: bug
 /issue view number: 12
 /issue close number: 12
@@ -35,6 +36,38 @@ Examples:
 `user` is a GitHub username that the repo can assign. The bot checks that, and only says "assigned" once GitHub confirms the person is on the issue (GitHub itself silently ignores people it cannot assign).
 
 Pull requests are not issues: the bot skips them in lists and refuses to view or close them.
+
+### Labels
+
+New issues get a **type** label and, when you know it, a **game** label. The bot only uses labels that already exist on the repo and never creates one.
+
+- Type: `bug` or `enhancement`. The repo has no `idea` label, so an idea is filed as `enhancement`.
+- Game: any label that starts with `game:` (for example `game:clash-of-saigon`). The list is read from the repo, so adding a game is just creating a `game:` label on GitHub. The bot remembers the label list for 10 minutes.
+- In a preview the type and game are drop-down menus, so you can fix what the AI chose. For a plain `/issue create` they are the `kind` and `game` options.
+- If GitHub cannot be asked for its labels, the issue is still created, without labels, and the reply says so.
+
+### Similar issues
+
+Before a create is confirmed, the bot searches the repo's issues (open and closed) for the words in your title and lists up to 3 matches under the preview. Then the buttons read **Create anyway** and **Use an existing one**. If the search fails or nothing matches, you just see the normal preview. `/bulk create` does not search.
+
+### Limits on creating
+
+To stop spam, every way of creating issues counts against the same limits:
+
+- One request every 5 seconds per person (`/issue create`, `/bulk create`, `/issue from-thread`, `/ask` and tagging) and 30 per minute overall.
+- At most `CREATE_LIMIT_PER_HOUR` new issues per person per hour (default 20, `0` means no limit). A bulk create counts one per title and is refused whole if it would pass the limit. The count goes up when you press Confirm, not when the preview appears. It resets when the bot restarts.
+
+### Create from a thread
+
+In a thread or forum post, run `/issue from-thread`, or tag the bot with something like "tạo issue từ thread này" / "make an issue from this thread". Only people with the role can.
+
+1. The bot reads the thread: its title, the starting post and up to 60 messages (the first 3 and the latest ones when it is longer; the preview says "Read N of M messages"). Bot messages are skipped, attachments are noted by file name only.
+2. Groq drafts a title, the type, a description, steps to reproduce, expected and actual result, and the game, only from what the thread says. The body is then put together by the bot, with a link back to the thread at the end.
+3. You get the usual preview with the labels, the type and game menus, any similar issues, and what is still missing (type and description are needed before **Confirm** works; steps to reproduce for a bug and the game are only advised).
+4. **Add details** opens a form (title, description, steps one per line, expected, actual) filled with the draft, to add what is missing.
+5. After Confirm the link is posted in the thread for everyone.
+
+`@name` written in a thread or in the form is made harmless, so it does not notify anyone on GitHub. The draft step is the only thing the thread text can influence: it cannot make the bot close, comment or assign anything.
 
 Long lists are paged: 20 issues per page, newest first. When there are more, the page footer says so and ◀ ▶ buttons appear under it. Only the person who ran the command can use the buttons, and they stop working after 3 minutes (run the command again). The same goes for "list open bugs" in plain language.
 
@@ -88,7 +121,7 @@ Use `/ask`, or tag the bot in any message:
 "Me" and `@mention` only work for people listed in `GITHUB_USER_MAP` (see below). For anyone else, type their GitHub username. The bot never guesses who you mean.
 
 - Reading (list, view) happens right away.
-- Writing (create, close, comment) first shows a preview with **Confirm** and **Cancel** buttons. Nothing changes on GitHub until you press Confirm. Only you can press the buttons, they work once, and they expire after 2 minutes.
+- Writing (create, close, comment) first shows a preview with **Confirm** and **Cancel** buttons. Nothing changes on GitHub until you press Confirm. Only you can press the buttons, they work once, and they expire after 2 minutes (5 minutes for a new issue, which you may want to edit).
 - Say the issue number yourself ("close 12"). If you don't, the bot asks which one you mean instead of guessing.
 - If you need a role you don't have, the bot says so and does nothing.
 
@@ -97,7 +130,7 @@ Use `/ask`, or tag the bot in any message:
 ### 1. Discord application
 
 1. In the [Developer Portal](https://discord.com/developers/applications) create an application, then **Bot** > **Reset Token** and copy the token.
-2. **OAuth2** > **URL Generator**: scopes `bot` and `applications.commands`, no bot permissions needed. Open the URL to invite the bot to your server.
+2. **OAuth2** > **URL Generator**: scopes `bot` and `applications.commands`. Bot permissions: View Channels, Send Messages, Send Messages in Threads and Read Message History (the last two are for creating issues from threads). Open the URL to invite the bot to your server.
 3. In Discord, enable Developer Mode (Settings > Advanced). Right-click the allowed role (Server Settings > Roles) and **Copy Role ID**. Right-click the server icon and **Copy Server ID**. These are numbers, not names.
 
 ### 2. GitHub token
@@ -122,6 +155,7 @@ cp .env.example .env     # Windows: copy .env.example .env
 | `ALLOWED_ROLE_ID` | Role ID (a number) allowed to write |
 | `DISCORD_GUILD_ID` | Optional. Your server ID. Without it, new commands can take up to an hour to appear |
 | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_FALLBACK_MODEL` | Optional, for plain language |
+| `CREATE_LIMIT_PER_HOUR` | Optional. Most issues one person can create per hour. Default 20, `0` means no limit |
 | `GITHUB_USER_MAP` | Optional. Comma-separated `<discord user id>=<github login>` pairs, for example `123456789=zinbac000,987654321=octocat`. Lets people say "assign to me" or tag a teammate. You edit it yourself, there is no self-service linking |
 
 `.env` is ignored by git. Never commit it.
@@ -150,9 +184,9 @@ Optional. With a Groq key the bot understands plain language, as described above
 Good to know:
 
 - `/ask` replies are visible only to you. Replies to a tag are normal replies in the channel, so a write preview from a tag is visible to everyone there (only you can press its buttons). Use `/ask` for writes if that matters.
-- Each message you send this way is sent to Groq, a third party. Issue content is never sent to Groq.
+- Each message you send this way is sent to Groq, a third party. Normally that is only the sentence you wrote. The one exception is [creating an issue from a thread](#create-from-a-thread): then the thread's text (its title and up to 60 messages, at most 12000 characters, with display names but no Discord ids) is sent to Groq too, and only when someone with the role asks for it. Do not use it on threads that must not leave Discord.
 - The bot logs one line per request (who, what they wrote, what it understood, the outcome), which helps when something looks wrong.
-- Requests are limited to one every 5 seconds per person and 30 per minute overall.
+- Requests are limited to one every 5 seconds per person and 30 per minute overall, and creating issues has an hourly cap as well (see [Limits on creating](#limits-on-creating)).
 
 ## Run as a service
 
@@ -200,6 +234,12 @@ then restart the bot, or run the installer again. It is safe to repeat.
 | Tagging does nothing | Message Content Intent is off in the Developer Portal, or `GROQ_API_KEY` is empty |
 | "X cannot be assigned in this repo" | The person is not a collaborator on the repo. Only collaborators (and the owner) can be assigned |
 | "I don't know which GitHub account that is" | "Me" or a mention for someone missing from `GITHUB_USER_MAP`. Type their GitHub username, or add them to the map |
+| The issue has no labels, or the reply says "without labels" | The label list could not be read, or the label does not exist on the repo. The bot never creates labels: add `bug`, `enhancement` or a `game:...` label on GitHub |
+| "There is no game label with that name" | Pick a game from the list that `/issue create game:` offers. Games are the repo's labels that start with `game:` |
+| "Run this inside a thread" | `/issue from-thread` or "create from this thread" only works in a thread or forum post |
+| "I cannot read or post in this thread" | The bot lacks View Channel, Read Message History or Send Messages in Threads there. Fix the channel or role permissions |
+| "You have reached the hourly limit" | You created `CREATE_LIMIT_PER_HOUR` issues in the last hour. Wait, or raise the limit in `.env` and restart |
+| No "similar issues" list shown | Nothing matched, the title has too few words, or GitHub's search limit (30 per minute) was hit. Creating still works |
 | "#N is a pull request, not an issue" | The number belongs to a pull request. The bot only handles issues |
 
 After changing `.env`, restart the bot.

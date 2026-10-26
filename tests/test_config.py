@@ -73,3 +73,18 @@ def test_user_map_is_parsed():
 def test_malformed_user_map_is_rejected(raw):
     with pytest.raises(ConfigError, match="GITHUB_USER_MAP"):
         load_settings({**VALID, "GITHUB_USER_MAP": raw})
+
+
+def test_create_limit_defaults_to_twenty():
+    assert load_settings(VALID).create_limit_per_hour == 20
+
+
+@pytest.mark.parametrize("raw, expected", [("5", 5), ("0", 0), (" 12 ", 12)])
+def test_create_limit_can_be_set(raw, expected):
+    assert load_settings({**VALID, "CREATE_LIMIT_PER_HOUR": raw}).create_limit_per_hour == expected
+
+
+@pytest.mark.parametrize("raw", ["abc", "-1", "1.5"])
+def test_create_limit_must_be_a_non_negative_number(raw):
+    with pytest.raises(ConfigError, match="CREATE_LIMIT_PER_HOUR"):
+        load_settings({**VALID, "CREATE_LIMIT_PER_HOUR": raw})

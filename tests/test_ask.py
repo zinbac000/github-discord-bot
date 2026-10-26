@@ -20,6 +20,7 @@ from github_discord_bot.intent import AIError, Intent
 
 ROLE = 111
 OWNER = 7
+LABELS = ["bug", "enhancement", "docs", "game:clash-of-saigon"]
 
 
 def issue(number=3, title="Login bug", state="open"):
@@ -34,6 +35,8 @@ def gh():
         get_issue=AsyncMock(return_value=issue(3)),
         close_issue=AsyncMock(return_value=issue(3, state="closed")),
         comment=AsyncMock(return_value="https://github.com/o/r/issues/3#c"),
+        list_labels=AsyncMock(return_value=LABELS),
+        search_issues=AsyncMock(return_value=[]),
     )
 
 
@@ -70,7 +73,7 @@ def view_from(reply):
     return reply.await_args.kwargs["view"]
 
 
-CREATE = Intent("create", title="Login lỗi", body="trên Safari", lang="vi")
+CREATE = Intent("create", title="Login lỗi", body="trên Safari", lang="vi", kind="bug")
 
 
 async def test_read_runs_immediately_without_view(gh):
@@ -100,7 +103,7 @@ async def test_confirm_creates_exactly_once_even_when_pressed_twice(gh):
     view = view_from(await run(gh, groq_returning(CREATE)))
     first, second = press(), press()
     await asyncio.gather(view.confirm.callback(first), view.confirm.callback(second))
-    gh.create_issue.assert_awaited_once_with("Login lỗi", "trên Safari")
+    gh.create_issue.assert_awaited_once_with("Login lỗi", "trên Safari", ["bug"])
     assert "Đã tạo" in first.edit_original_response.await_args.kwargs["content"]
     second.response.send_message.assert_awaited_once()
     assert all(item.disabled for item in view.children)
@@ -228,6 +231,7 @@ def message(content, *, mentions=True, bot_author=False, bot=None):
         author=SimpleNamespace(bot=bot_author, id=OWNER, roles=[]),
         mentions=[bot._connection.user] if mentions else [],
         content=content,
+        channel=SimpleNamespace(),
         reply=AsyncMock(),
     )
 
